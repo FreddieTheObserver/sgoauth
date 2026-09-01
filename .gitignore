@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------
+# sgoauth — Next.js + NestJS + Prisma/Postgres monorepo
+# Note: pnpm-lock.yaml IS committed on purpose (reproducible installs).
+# ---------------------------------------------------------------
+
+# Dependencies
+node_modules/
+.pnpm-store/
+.pnp.*
+
+# Secrets — .env.example is the committed template, everything else is local
+.env
+.env.*
+!.env.example
+
+# Keys and certificates (mkcert local HTTPS, any test keypairs)
+*.pem
+*.key
+*.crt
+*.p12
+
+# Build output
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Prisma generated client — build output, regenerated from schema.prisma.
+# Keep `postinstall: prisma generate` in apps/api/package.json so it exists after clone.
+**/src/generated/
+
+# Tests and coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Caches
+.cache/
+.eslintcache
+.stylelintcache
+.vite/
+.turbo/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
