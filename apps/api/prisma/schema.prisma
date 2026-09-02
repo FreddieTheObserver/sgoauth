@@ -1,0 +1,87 @@
+// sgoauth — identity, sessions and audit trail.
+//
+// Two choices here carry most of the security weight:
+//   1. Identity is keyed on (provider, providerAccountId) — the Google `sub` — never on email.
+//      Emails change, and a lapsed Workspace domain can hand an address to a new owner.
+//   2. Sessions store sha256(token), never the token. A database leak yields hashes of
+//      256-bit random values: not reversible, not replayable.
+//
+// The connection string lives in ../prisma.config.ts (Prisma 7 — no `url` in the datasource).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id              String    @id @default(cuid(2))
+  email           String    @unique
+  emailVerifiedAt DateTime?
+  name            String?
+  avatarUrl       String?
+  role            Role      @default(USER)
+  disabledAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  accounts OAuthAccount[]
+  sessions Session[]
+  events   AuthEvent[]
+}
+
+model OAuthAccount {
+  id                String   @id @default(cuid(2))
+  userId            String
+  provider          String // "google" — generic on purpose; GitHub/Microsoft are additive
+  providerAccountId String // Google `sub`. THE identity key. Never the email.
+  email             String? // snapshot for display/audit only
+  refreshTokenEnc   Bytes? // AES-256-GCM, only if offline access is ever enabled
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id                String    @id @default(cuid(2))
+  userId            String
+  tokenHash         Bytes     @unique // sha256(cookie value) — the raw token is never stored
+  userAgent         String?
+  ipHash            String?
+  createdAt         DateTime  @default(now())
+  lastUsedAt        DateTime  @default(now())
+  expiresAt         DateTime // sliding
+  absoluteExpiresAt DateTime // hard cap, never extended
+  revokedAt         DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Append-only. Never updated or deleted by application code.
+model AuthEvent {
+  id        String   @id @default(cuid(2))
+  userId    String?
+  type      String // login.success | login.denied | session.revoked | account.linked | ...
+  ipHash    String?
+  userAgent String?
+  detail    Json?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+}
