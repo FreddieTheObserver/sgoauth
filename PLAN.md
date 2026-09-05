@@ -22,7 +22,7 @@ fail, and a schema that makes GitHub/Microsoft login or passkeys an additive cha
 |---|---|
 | Session credential | Opaque 256-bit token in cookie; SHA-256 hash stored in Postgres |
 | Topology | Single origin — Next rewrites `/api/*` → NestJS. No CORS. `__Host-` cookies, `SameSite=Lax` |
-| OAuth mechanics | `arctic` for the code exchange (PKCE mandatory) + `jose` for explicit ID-token verification |
+| OAuth mechanics | Our own PKCE + code exchange (~60 lines) + `jose` for explicit ID-token verification |
 | Scope | Core login + session/device management + security test suite + hardening layer + RBAC & audit log |
 
 Version notes worth knowing up front, all verified against the registry/docs at time of writing:
@@ -31,10 +31,16 @@ Version notes worth knowing up front, all verified against the registry/docs at 
   Pin `prisma@7.10.0` and `@prisma/client@7.10.0` explicitly.
 - **Next.js 16 renamed `middleware.ts` → `proxy.ts`** (`export function proxy(request)`), and it now runs on
   the **Node.js runtime**. `middleware.ts` is deprecated.
-- **arctic's `decodeIdToken()` only decodes — it does not verify.** Google's ID token must be checked with
-  `jose.jwtVerify` against Google's JWKS. This is the single most important line of code in the project.
-- arctic's `createAuthorizationURL(state, codeVerifier, scopes)` takes no `nonce`; it returns a `URL`, so we
-  append `nonce` / `prompt` / `hd` via `url.searchParams.set(...)`.
+- **`arctic` is deprecated** — npm reports "Package no longer supported" on 3.7.0, which is itself the
+  `latest` tag, so there is no patched version to move to. An unmaintained dependency on the code-exchange
+  path gets no security fixes, and what it was doing for us is PKCE generation, one URL builder and one
+  `POST` to Google's token endpoint. We write those ourselves: ~60 lines, no dependency, and it suits the
+  project's own goal of keeping the security-critical steps visible rather than buried in a library.
+  `openid-client` is the maintained alternative and the better call for a team that does not want to own
+  this code — it just hides exactly the steps this project exists to make legible.
+- **The ID token must be verified, not decoded.** `jose.jwtVerify` against Google's JWKS is the trust
+  anchor and the single most important line of code in the project. `jose` stays: actively maintained,
+  and the piece we would never hand-roll.
 - Prisma 7: `datasource db { provider = "postgresql" }` carries **no `url`** — the connection string lives in
   `prisma.config.ts` and the `PrismaPg` adapter.
 
@@ -195,7 +201,7 @@ common/
   logger.ts                     pino, redacting cookie / set-cookie / authorization / code
 auth/
   auth.controller.ts
-  google.service.ts           arctic client + jose ID-token verification
+  google.service.ts           PKCE + code exchange + jose ID-token verification
   oauth-tx.service.ts         the encrypted handshake cookie
   session.service.ts          mint / validate / slide / revoke
   account.service.ts          upsert + linking rules
@@ -218,9 +224,10 @@ users/  health/  audit/
 
 ### `GET /auth/google`
 
-1. `arctic.generateState()`, `arctic.generateCodeVerifier()`, `randomBytes(32)` → nonce.
-2. `google.createAuthorizationURL(state, codeVerifier, ['openid','email','profile'])`, then set
-   `nonce`, `prompt=select_account`, and `hd` if `ALLOWED_HD` is configured.
+1. `state`, `codeVerifier` and `nonce`, each `base64url(randomBytes(32))` from `crypto`.
+2. Build the authorization URL: `client_id`, `redirect_uri`, `response_type=code`,
+   `scope=openid email profile`, `state`, `nonce`, `prompt=select_account`, `hd` if `ALLOWED_HD` is
+   configured, and PKCE — `code_challenge = base64url(sha256(codeVerifier))`, `code_challenge_method=S256`.
 3. **Do not send `access_type=offline`.** For a login-only app we never want a Google refresh token —
    nothing to store means nothing to leak. Gate it behind a future flag if Google API access is ever added.
 4. Set **one** `__Host-oauth_tx` cookie: a `jose` `EncryptJWT` (`dir` + `A256GCM`, key from `OAUTH_TX_SECRET`)
@@ -239,8 +246,9 @@ carries Lax cookies; `Strict` would drop them and break the flow.
    Missing or undecryptable → 403.
 3. `crypto.timingSafeEqual(state_from_cookie, state_from_query)` → mismatch is 403. This is the CSRF /
    login-fixation defense: an attacker cannot make you log into *their* Google account.
-4. `google.validateAuthorizationCode(code, codeVerifier)` — PKCE binds the code to the browser that started
-   the flow, so an intercepted code is useless on its own.
+4. `POST https://oauth2.googleapis.com/token` with the code, `code_verifier`, client credentials and
+   `grant_type=authorization_code` — PKCE binds the code to the browser that started the flow, so an
+   intercepted code is useless on its own.
 5. **Verify the ID token.** Not optional, not `decodeIdToken`:
    ```ts
    // module-level: caches keys and handles rotation
@@ -278,8 +286,12 @@ carries Lax cookies; `Strict` would drop them and break the flow.
   `absoluteExpiresAt`, or the user is disabled. Update `lastUsedAt`.
 - **Slide:** when less than half the TTL remains, extend `expiresAt` (never past `absoluteExpiresAt`) and
   re-set the cookie. Idle sessions die; active ones don't nag; nothing lives forever.
-- **Revoke:** delete the row. Effective on the very next request, everywhere.
-- `@nestjs/schedule` job prunes expired rows.
+- **Revoke:** set `revokedAt`; never delete. `validate` already rejects on it, so the effect lands on the
+  very next request either way — but the device list needs to tell "you revoked this" apart from "this row
+  never existed", an `AuthEvent` of `session.revoked` is only correlatable while its session survives, and
+  "log out everywhere" becomes one `updateMany` rather than a delete racing the cascade. The leftover
+  `tokenHash` is a SHA-256 of a token the browser no longer holds, so retention costs nothing.
+- `@nestjs/schedule` job prunes expired and revoked rows together.
 
 ### `return-to.ts` — open redirect
 
@@ -409,7 +421,7 @@ Compact reference; the long form goes in `SECURITY.md`.
 | `SameSite=Lax` + Origin guard | CSRF on state-changing requests |
 | Opaque token, SHA-256 at rest | DB leak → no replayable credentials |
 | Sliding + absolute expiry | Unbounded session lifetime |
-| Revocation by row delete | Stale access after logout, ban, or role change |
+| Revocation via `revokedAt` | Stale access after logout, ban, or role change |
 | No `access_type=offline` | Nothing to store means nothing to leak |
 | `safeReturnTo` | Open redirect → phishing / token leakage |
 | 302 off the callback URL | Code sitting in history, Referer, and logs |
@@ -471,7 +483,7 @@ login, revoke and logout rows are there.
 ## Beyond v1
 
 The schema is already shaped for these: additional providers (`OAuthAccount` is generic — GitHub/Microsoft
-is a new arctic client and a config entry), email + password with argon2id, TOTP MFA, WebAuthn passkeys,
+is one more provider config and client), email + password with argon2id, TOTP MFA, WebAuthn passkeys,
 step-up re-auth for sensitive actions, encrypted-at-rest Google refresh tokens if you ever call Google APIs,
 anomaly detection off `AuthEvent`, and a separate migrator-vs-runtime Postgres role with `sslmode=require`
 for deployment.
