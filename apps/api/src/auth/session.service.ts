@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import type { SessionUser } from '../common/types/session-user.js';
 import { env } from '../config/env.js';
@@ -18,6 +18,16 @@ export function hashSessionToken(token: string): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(createHash('sha256').update(token, 'utf8').digest());
 }
 
+// 256 bits from the CSPRNG. The entropy is what makes a plain hash at rest
+// safe, and what makes guessing a live session id not worth attempting.
+const TOKEN_BYTES = 32;
+
+export interface MintedSession {
+  /** The raw cookie value. Held only long enough to be written to a header. */
+  token: string;
+  expiresAt: Date;
+}
+
 export interface ValidatedSession {
   user: SessionUser;
   session: { id: string; expiresAt: Date };
@@ -28,8 +38,40 @@ export interface ValidatedSession {
 @Injectable()
 export class SessionService {
   private readonly ttlMs = env.SESSION_TTL_DAYS * DAY_MS;
+  private readonly absoluteTtlMs = env.SESSION_ABSOLUTE_TTL_DAYS * DAY_MS;
 
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Issue a session. The token is returned to the caller and never stored - what
+   * goes in the database is its SHA-256, so a dump of the Session table yields
+   * nothing replayable.
+   */
+  async mint(
+    userId: string,
+    context: { userAgent?: string | null; ipHash?: string | null },
+  ): Promise<MintedSession> {
+    const token = randomBytes(TOKEN_BYTES).toString('base64url');
+    const now = Date.now();
+    const expiresAt = new Date(now + this.ttlMs);
+
+    await this.prisma.session.create({
+      data: {
+        userId,
+        tokenHash: hashSessionToken(token),
+        // Truncated because it is attacker-controlled and only ever displayed:
+        // an unbounded header should not become an unbounded column.
+        userAgent: context.userAgent?.slice(0, 512) ?? null,
+        ipHash: context.ipHash ?? null,
+        expiresAt,
+        // Fixed at creation and never extended. This is the ceiling that makes
+        // the sliding window safe.
+        absoluteExpiresAt: new Date(now + this.absoluteTtlMs),
+      },
+    });
+
+    return { token, expiresAt };
+  }
 
   /**
    * Turn a raw cookie value into a caller, or into nothing.

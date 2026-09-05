@@ -1,11 +1,54 @@
 import { createHash } from 'node:crypto';
+import {
+  SignJWT,
+  createLocalJWKSet,
+  exportJWK,
+  generateKeyPair,
+  type JWTVerifyGetKey,
+  type JWK,
+} from 'jose';
 import { env } from '../config/env.js';
 import { GoogleService, randomToken } from './google.service.js';
 
+// A Google we control: our own RSA keypair, served as a local JWKS, so the suite
+// can sign ID tokens on purpose and prove the forgeries are refused.
+const { publicKey, privateKey } = await generateKeyPair('RS256', { extractable: true });
+const jwk = { ...((await exportJWK(publicKey)) as JWK), alg: 'RS256' };
+const jwks = createLocalJWKSet({ keys: [jwk] });
+
+const { privateKey: foreignKey } = await generateKeyPair('RS256', { extractable: true });
+
+const NONCE = 'the-nonce';
+
+const signIdToken = async (
+  claims: Record<string, unknown> = {},
+  options: { key?: CryptoKey; issuer?: string; audience?: string; expired?: boolean } = {},
+) => {
+  const token = new SignJWT({
+    email: 'ada@example.com',
+    email_verified: true,
+    name: 'Ada Lovelace',
+    picture: 'https://example.com/ada.png',
+    nonce: NONCE,
+    ...claims,
+  })
+    .setProtectedHeader({ alg: 'RS256' })
+    .setSubject((claims.sub as string) ?? 'google-sub-123')
+    .setIssuer(options.issuer ?? 'https://accounts.google.com')
+    .setAudience(options.audience ?? env.GOOGLE_CLIENT_ID)
+    .setIssuedAt(options.expired ? Math.floor(Date.now() / 1000) - 7200 : undefined)
+    .setExpirationTime(options.expired ? Math.floor(Date.now() / 1000) - 3600 : '5m');
+
+  return token.sign(options.key ?? privateKey);
+};
+
 describe('GoogleService.createAuthorizationUrl', () => {
-  const service = new GoogleService();
-  const params = { state: 'the-state', codeVerifier: 'the-verifier', nonce: 'the-nonce' };
-  const url = service.createAuthorizationUrl(params);
+  const service = new GoogleService(jwks);
+  const url = service.createAuthorizationUrl({
+    state: 'the-state',
+    codeVerifier: 'the-verifier',
+    nonce: 'the-nonce',
+  });
   const query = url.searchParams;
 
   it('points at Google', () => {
@@ -48,6 +91,146 @@ describe('GoogleService.createAuthorizationUrl', () => {
 
   it('omits hd when no workspace domain is configured', () => {
     expect(query.get('hd')).toBe(env.ALLOWED_HD ?? null);
+  });
+});
+
+describe('GoogleService.verifyIdToken', () => {
+  const service = new GoogleService(jwks);
+
+  it('accepts a properly signed token and returns the identity', async () => {
+    const identity = await service.verifyIdToken(await signIdToken(), NONCE);
+
+    expect(identity).toEqual({
+      sub: 'google-sub-123',
+      email: 'ada@example.com',
+      name: 'Ada Lovelace',
+      avatarUrl: 'https://example.com/ada.png',
+    });
+  });
+
+  it('refuses a token signed by the wrong key', async () => {
+    // The whole trust anchor: a token that is well-formed and has every correct
+    // claim is still worthless without Google's signature.
+    const forged = await signIdToken({}, { key: foreignKey });
+    await expect(service.verifyIdToken(forged, NONCE)).resolves.toBeNull();
+  });
+
+  it('refuses a token minted for a different client', async () => {
+    const other = await signIdToken({}, { audience: 'someone-else.apps.googleusercontent.com' });
+    await expect(service.verifyIdToken(other, NONCE)).resolves.toBeNull();
+  });
+
+  it('refuses a token from the wrong issuer', async () => {
+    const other = await signIdToken({}, { issuer: 'https://accounts.evil.com' });
+    await expect(service.verifyIdToken(other, NONCE)).resolves.toBeNull();
+  });
+
+  it('accepts both spellings of the Google issuer', async () => {
+    const bare = await signIdToken({}, { issuer: 'accounts.google.com' });
+    await expect(service.verifyIdToken(bare, NONCE)).resolves.not.toBeNull();
+  });
+
+  it('refuses an expired token', async () => {
+    const stale = await signIdToken({}, { expired: true });
+    await expect(service.verifyIdToken(stale, NONCE)).resolves.toBeNull();
+  });
+
+  it('refuses a nonce that does not match the handshake', async () => {
+    const replayed = await signIdToken({ nonce: 'a-different-handshake' });
+    await expect(service.verifyIdToken(replayed, NONCE)).resolves.toBeNull();
+  });
+
+  it('refuses a token with no nonce at all', async () => {
+    const noNonce = await signIdToken({ nonce: undefined });
+    await expect(service.verifyIdToken(noNonce, NONCE)).resolves.toBeNull();
+  });
+
+  it.each([
+    ['false', false],
+    ['the string "true"', 'true'],
+    ['missing', undefined],
+  ])('refuses an email_verified of %s', async (_label, value) => {
+    // Strictly boolean true. Google sends a boolean in ID tokens; anything else
+    // is a different document than the one we decided to trust.
+    const token = await signIdToken({ email_verified: value });
+    await expect(service.verifyIdToken(token, NONCE)).resolves.toBeNull();
+  });
+
+  it('refuses a token with no subject', async () => {
+    const token = await new SignJWT({ email: 'ada@example.com', email_verified: true, nonce: NONCE })
+      .setProtectedHeader({ alg: 'RS256' })
+      .setIssuer('https://accounts.google.com')
+      .setAudience(env.GOOGLE_CLIENT_ID)
+      .setExpirationTime('5m')
+      .sign(privateKey);
+
+    await expect(service.verifyIdToken(token, NONCE)).resolves.toBeNull();
+  });
+
+  it('refuses garbage', async () => {
+    await expect(service.verifyIdToken('not-a-jwt', NONCE)).resolves.toBeNull();
+    await expect(service.verifyIdToken('', NONCE)).resolves.toBeNull();
+  });
+
+  it('tolerates a missing name and picture', async () => {
+    const sparse = await signIdToken({ name: undefined, picture: undefined });
+    await expect(service.verifyIdToken(sparse, NONCE)).resolves.toEqual({
+      sub: 'google-sub-123',
+      email: 'ada@example.com',
+      name: null,
+      avatarUrl: null,
+    });
+  });
+});
+
+describe('GoogleService.exchangeCode', () => {
+  const service = new GoogleService({} as JWTVerifyGetKey);
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const stubFetch = (impl: (url: string, init: RequestInit) => Promise<Response> | Response) => {
+    const spy = vi.fn(impl);
+    vi.stubGlobal('fetch', spy);
+    return spy;
+  };
+
+  it('posts the code and the PKCE verifier, and returns the id_token', async () => {
+    const spy = stubFetch(() => Response.json({ id_token: 'the-id-token' }));
+
+    await expect(service.exchangeCode('the-code', 'the-verifier')).resolves.toBe('the-id-token');
+
+    const [url, init] = spy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://oauth2.googleapis.com/token');
+    expect(init.method).toBe('POST');
+
+    const body = new URLSearchParams(String(init.body));
+    expect(body.get('grant_type')).toBe('authorization_code');
+    expect(body.get('code')).toBe('the-code');
+    expect(body.get('code_verifier')).toBe('the-verifier');
+    expect(body.get('redirect_uri')).toBe(env.GOOGLE_REDIRECT_URI);
+    expect(body.get('client_secret')).toBe(env.GOOGLE_CLIENT_SECRET);
+  });
+
+  it('returns null when Google rejects the code', async () => {
+    stubFetch(() => Response.json({ error: 'invalid_grant' }, { status: 400 }));
+    await expect(service.exchangeCode('used-code', 'verifier')).resolves.toBeNull();
+  });
+
+  it('returns null when the response carries no id_token', async () => {
+    stubFetch(() => Response.json({ access_token: 'only-this' }));
+    await expect(service.exchangeCode('code', 'verifier')).resolves.toBeNull();
+  });
+
+  it('returns null when Google cannot be reached', async () => {
+    stubFetch(() => Promise.reject(new Error('ECONNREFUSED')));
+    await expect(service.exchangeCode('code', 'verifier')).resolves.toBeNull();
+  });
+
+  it('returns null on an unparseable body', async () => {
+    stubFetch(() => new Response('<html>502</html>', { status: 200 }));
+    await expect(service.exchangeCode('code', 'verifier')).resolves.toBeNull();
   });
 });
 
