@@ -32,10 +32,24 @@ const baseOptions: CookieOptions = {
   path: '/',
 };
 
-export function setSessionCookie(res: Response, token: string, expiresAt: Date): void {
-  // The browser expires the cookie at the same moment the row expires, so a
-  // dead session stops being sent rather than being sent and rejected.
-  res.cookie(SESSION_COOKIE, token, { ...baseOptions, expires: expiresAt });
+/**
+ * The expiry written here is the session's *absolute* cap, not its sliding one.
+ *
+ * The sliding window is enforced in one place - SessionService.validate, against
+ * the row - and the cookie carries only the outer bound past which no session can
+ * be alive at all. Pinning the cookie to the sliding expiry instead sounds
+ * tighter and does not survive contact with a server-rendered app: the renewal
+ * arrives as a Set-Cookie on a fetch the Next server makes on the browser's
+ * behalf, which swallows it, so the row would slide while the browser's copy
+ * still died on the original date.
+ *
+ * What it costs: a browser can keep sending a cookie whose row has idled out.
+ * That is one rejected request, after which the guard clears it - the credential
+ * was never valid a moment longer, because validity was never the cookie's to
+ * decide.
+ */
+export function setSessionCookie(res: Response, token: string, absoluteExpiresAt: Date): void {
+  res.cookie(SESSION_COOKIE, token, { ...baseOptions, expires: absoluteExpiresAt });
 }
 
 export function clearSessionCookie(res: Response): void {

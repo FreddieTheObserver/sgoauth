@@ -136,7 +136,7 @@ export class AuthController {
 
     // 7. Mint the session and write the trail.
     const session = await this.sessions.mint(user.id, context);
-    setSessionCookie(res, session.token, session.expiresAt);
+    setSessionCookie(res, session.token, session.absoluteExpiresAt);
     await this.audit.record({ type: AuthEventType.LoginSuccess, userId: user.id, ...context });
 
     // 8. Redirect away from the callback URL, so the authorization code stops

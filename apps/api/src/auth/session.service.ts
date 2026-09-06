@@ -43,14 +43,13 @@ function activeSessions(userId: string, now: Date): Prisma.SessionWhereInput {
 export interface MintedSession {
   /** The raw cookie value. Held only long enough to be written to a header. */
   token: string;
-  expiresAt: Date;
+  /** What the cookie's own expiry is set to - see setSessionCookie. */
+  absoluteExpiresAt: Date;
 }
 
 export interface ValidatedSession {
   user: SessionUser;
   session: { id: string; expiresAt: Date };
-  /** The sliding window moved — the caller must re-set the cookie with this expiry. */
-  renewed: boolean;
 }
 
 /** One row of the device list. Everything the owner needs to recognise a
@@ -84,6 +83,7 @@ export class SessionService {
     const token = randomBytes(TOKEN_BYTES).toString('base64url');
     const now = Date.now();
     const expiresAt = new Date(now + this.ttlMs);
+    const absoluteExpiresAt = new Date(now + this.absoluteTtlMs);
 
     await this.prisma.session.create({
       data: {
@@ -95,12 +95,12 @@ export class SessionService {
         ipHash: context.ipHash ?? null,
         expiresAt,
         // Fixed at creation and never extended. This is the ceiling that makes
-        // the sliding window safe.
-        absoluteExpiresAt: new Date(now + this.absoluteTtlMs),
+        // the sliding window safe, and the only expiry the cookie ever carries.
+        absoluteExpiresAt,
       },
     });
 
-    return { token, expiresAt };
+    return { token, absoluteExpiresAt };
   }
 
   /**
@@ -146,13 +146,15 @@ export class SessionService {
     // A ban takes effect on the next request rather than at the next login.
     if (session.user.disabledAt !== null) return null;
 
-    const { expiresAt, renewed } = this.slide(session.expiresAt, session.absoluteExpiresAt, now);
+    const { expiresAt, extended } = this.slide(session.expiresAt, session.absoluteExpiresAt, now);
 
     // One write covers both: `lastUsedAt` feeds the device list, and the new
-    // expiry only when the window actually moved.
+    // expiry only when the window actually moved. Nothing goes back to the
+    // browser either way - the cookie is pinned to the absolute cap, so sliding
+    // is a fact about the row and never a header.
     await this.prisma.session.update({
       where: { id: session.id },
-      data: renewed ? { lastUsedAt: now, expiresAt } : { lastUsedAt: now },
+      data: extended ? { lastUsedAt: now, expiresAt } : { lastUsedAt: now },
     });
 
     return {
@@ -166,7 +168,6 @@ export class SessionService {
         role: session.user.role,
       },
       session: { id: session.id, expiresAt },
-      renewed,
     };
   }
 
@@ -286,18 +287,18 @@ export class SessionService {
     expiresAt: Date,
     absoluteExpiresAt: Date,
     now: Date,
-  ): { expiresAt: Date; renewed: boolean } {
+  ): { expiresAt: Date; extended: boolean } {
     if (expiresAt.getTime() - now.getTime() >= this.ttlMs / 2) {
-      return { expiresAt, renewed: false };
+      return { expiresAt, extended: false };
     }
 
-    const extended = Math.min(now.getTime() + this.ttlMs, absoluteExpiresAt.getTime());
+    const moved = Math.min(now.getTime() + this.ttlMs, absoluteExpiresAt.getTime());
     // Inside the last half-TTL before the hard cap the extension is clamped to a
-    // value we already have, and re-setting the cookie would be pure noise.
-    if (extended <= expiresAt.getTime()) {
-      return { expiresAt, renewed: false };
+    // value the row already holds, and writing it again would be pure noise.
+    if (moved <= expiresAt.getTime()) {
+      return { expiresAt, extended: false };
     }
 
-    return { expiresAt: new Date(extended), renewed: true };
+    return { expiresAt: new Date(moved), extended: true };
   }
 }

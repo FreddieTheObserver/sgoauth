@@ -90,8 +90,9 @@ describe('session routes (e2e)', () => {
     (res.headers['set-cookie'] as unknown as string[]) ?? [];
 
   /**
-   * The last Set-Cookie for a name is the one the browser keeps, so it is the
-   * only one worth asserting on: the guard may have re-set the session first.
+   * The last Set-Cookie for a name is the one the browser keeps. Since the guard
+   * stopped writing the session cookie back there should only ever be one, which
+   * a test below asserts outright.
    */
   const finalSessionCookie = (res: request.Response): string | undefined =>
     setCookies(res)
@@ -215,9 +216,9 @@ describe('session routes (e2e)', () => {
       expect(await revocations(user.id)).toHaveLength(1);
     });
 
-    it('leaves the cookie dead even when the guard had just slid the window', async () => {
-      // In the back half of the window the guard re-sets the cookie and then the
-      // handler clears it. The order matters: the clear has to be the one kept.
+    it('sends exactly one cookie header when the window slid on the way in', async () => {
+      // The guard slides the row here and writes nothing back, so the clear is
+      // the only Set-Cookie on the response rather than the last of two.
       const user = await makeUser();
       const { token } = await makeSession(user.id, { expiresAt: new Date(Date.now() + 2 * DAY) });
 
@@ -227,7 +228,11 @@ describe('session routes (e2e)', () => {
         .set('Origin', ORIGIN)
         .expect(303);
 
-      expect(finalSessionCookie(res)).toContain(`${SESSION_COOKIE}=;`);
+      const sessionCookies = setCookies(res).filter((c) =>
+        c.startsWith(`${SESSION_COOKIE}=`),
+      );
+      expect(sessionCookies).toHaveLength(1);
+      expect(sessionCookies[0]).toContain(`${SESSION_COOKIE}=;`);
     });
 
     it('makes the cookie useless on the very next request', async () => {

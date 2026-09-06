@@ -65,7 +65,6 @@ describe('SessionService.validate', () => {
     // disabledAt is an internal column and must not ride along on every request.
     expect(result?.user).not.toHaveProperty('disabledAt');
     expect(result?.session.id).toBe('s1');
-    expect(result?.renewed).toBe(false);
     // Well inside the window: lastUsedAt moves, the expiry does not.
     expect(update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -97,7 +96,6 @@ describe('SessionService.validate', () => {
     const { service, update } = build(row({ expiresAt: at(2 * DAY) }));
     const result = await service.validate('raw-token');
 
-    expect(result?.renewed).toBe(true);
     // A fresh full TTL from now, not an increment on the old expiry.
     expect(result?.session.expiresAt.getTime()).toBeGreaterThan(now + 6.9 * DAY);
     expect(update).toHaveBeenCalledWith(
@@ -112,16 +110,14 @@ describe('SessionService.validate', () => {
     const { service } = build(row({ expiresAt: at(DAY), absoluteExpiresAt: cap }));
     const result = await service.validate('raw-token');
 
-    expect(result?.renewed).toBe(true);
     expect(result?.session.expiresAt).toEqual(cap);
   });
 
-  it('does not re-set the cookie when the cap leaves nothing to extend', async () => {
+  it('does not write the expiry again when the cap leaves nothing to extend', async () => {
     const cap = at(DAY);
     const { service, update } = build(row({ expiresAt: cap, absoluteExpiresAt: cap }));
     const result = await service.validate('raw-token');
 
-    expect(result?.renewed).toBe(false);
     expect(result?.session.expiresAt).toEqual(cap);
     expect(update).toHaveBeenCalledWith(
       expect.objectContaining({

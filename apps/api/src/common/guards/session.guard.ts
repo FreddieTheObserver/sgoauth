@@ -5,7 +5,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { SESSION_COOKIE, clearSessionCookie, setSessionCookie } from '../../auth/cookies.js';
+import { SESSION_COOKIE, clearSessionCookie } from '../../auth/cookies.js';
 import { SessionService } from '../../auth/session.service.js';
 import type { AuthenticatedRequest } from '../types/session-user.js';
 
@@ -39,12 +39,10 @@ export class SessionGuard implements CanActivate {
       throw new UnauthorizedException();
     }
 
-    if (validated.renewed) {
-      // Same token, later expiry. Rotating the value here instead would race
-      // with concurrent requests from the same browser and log the user out.
-      setSessionCookie(http.getResponse<Response>(), token, validated.session.expiresAt);
-    }
-
+    // Nothing is written back on success. The cookie carries the absolute cap
+    // and never changes, so a slid window needs no header - which is what lets
+    // sliding work for pages rendered on the server, where a Set-Cookie from the
+    // API would be swallowed by the fetch that asked for it.
     request.user = validated.user;
     request.session = validated.session;
     return true;

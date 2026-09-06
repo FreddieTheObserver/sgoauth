@@ -57,31 +57,28 @@ describe('SessionGuard', () => {
 
   it('attaches the user and session on success', async () => {
     const expiresAt = new Date('2026-01-08T00:00:00Z');
-    const { guard, validate, response } = build({
-      user,
-      session: { id: 's1', expiresAt },
-      renewed: false,
-    });
+    const { guard, validate, response } = build({ user, session: { id: 's1', expiresAt } });
     const { context, request } = contextFor({ [SESSION_COOKIE]: 'good-token' }, response);
 
     await expect(guard.canActivate(context)).resolves.toBe(true);
     expect(validate).toHaveBeenCalledWith('good-token');
     expect(request.user).toEqual(user);
     expect(request.session).toEqual({ id: 's1', expiresAt });
-    // Nothing slid, so no redundant Set-Cookie on the response.
-    expect(response.cookie).not.toHaveBeenCalled();
   });
 
-  it('re-sets the cookie with the same token when the window slides', async () => {
-    const expiresAt = new Date('2026-01-08T00:00:00Z');
-    const { guard, response } = build({ user, session: { id: 's1', expiresAt }, renewed: true });
+  it('never writes a cookie back on success, however far the window slid', async () => {
+    // The cookie carries the absolute cap and never changes, so an authenticated
+    // request costs no Set-Cookie header. It is also what makes sliding work at
+    // all for a server-rendered page: a renewal header would be swallowed by the
+    // Next-side fetch that asked for it, leaving the row extended and the
+    // browser's copy still expiring on the original date.
+    const { guard, response } = build({
+      user,
+      session: { id: 's1', expiresAt: new Date('2026-02-01T00:00:00Z') },
+    });
     const { context } = contextFor({ [SESSION_COOKIE]: 'good-token' }, response);
 
     await expect(guard.canActivate(context)).resolves.toBe(true);
-    expect(response.cookie).toHaveBeenCalledWith(
-      SESSION_COOKIE,
-      'good-token',
-      expect.objectContaining({ expires: expiresAt, httpOnly: true, secure: true }),
-    );
+    expect(response.cookie).not.toHaveBeenCalled();
   });
 });

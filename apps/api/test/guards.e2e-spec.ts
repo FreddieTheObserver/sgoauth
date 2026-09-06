@@ -158,7 +158,7 @@ describe('guards (e2e)', () => {
       await request(app.getHttpServer()).get('/auth/me').set('Cookie', cookie(token)).expect(401);
     });
 
-    it('slides the window and re-sets the cookie', async () => {
+    it('slides the window in the row without writing a cookie back', async () => {
       const user = await makeUser();
       const { token, session } = await makeSession(user.id, {
         expiresAt: new Date(Date.now() + 2 * DAY),
@@ -169,15 +169,13 @@ describe('guards (e2e)', () => {
         .set('Cookie', cookie(token))
         .expect(200);
 
-      const setCookie = String(res.headers['set-cookie']);
-      expect(setCookie).toContain(`${SESSION_COOKIE}=${token}`);
-      expect(setCookie).toContain('HttpOnly');
-      expect(setCookie).toContain('Secure');
-      expect(setCookie).toContain('SameSite=Lax');
-      expect(setCookie).toContain('Path=/');
-
       const after = await prisma.session.findUniqueOrThrow({ where: { id: session.id } });
       expect(after.expiresAt.getTime()).toBeGreaterThan(session.expiresAt.getTime());
+      // The row moved and the response carries nothing. The cookie was pinned to
+      // the absolute cap when it was minted, which is why a renewal header is
+      // not needed here - and why sliding survives a page rendered on the Next
+      // server, where a Set-Cookie from this API would be swallowed.
+      expect(res.headers['set-cookie']).toBeUndefined();
     });
 
     it('never slides past the absolute cap', async () => {

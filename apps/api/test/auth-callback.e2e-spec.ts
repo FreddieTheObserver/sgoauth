@@ -179,6 +179,16 @@ describe('GET /auth/google/callback (e2e)', () => {
       expect(Buffer.from(session.tokenHash).equals(hashSessionToken(token))).toBe(true);
       expect(JSON.stringify(session)).not.toContain(token);
       expect(session.ipHash).not.toBeNull();
+
+      // The cookie's own expiry is the absolute cap, not the sliding one. The
+      // sliding window lives in the row and is enforced on every request; the
+      // cookie only carries the outer bound past which no session can be alive.
+      const expires = /Expires=([^;]+)/.exec(cookie as string)?.[1];
+      expect(new Date(expires as string).getTime()).toBe(
+        // Set-Cookie dates have no sub-second precision.
+        Math.floor(session.absoluteExpiresAt.getTime() / 1000) * 1000,
+      );
+      expect(session.absoluteExpiresAt.getTime()).toBeGreaterThan(session.expiresAt.getTime());
     });
 
     it('clears the handshake cookie so it is strictly single-use', async () => {
