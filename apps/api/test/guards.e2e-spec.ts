@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { Controller, Get, Post, UseGuards, type INestApplication } from '@nestjs/common';
+import { Controller, Get, UseGuards, type INestApplication } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 import cookieParser from 'cookie-parser';
@@ -7,34 +7,22 @@ import request from 'supertest';
 import { AppModule } from '../src/app.module.js';
 import { SESSION_COOKIE } from '../src/auth/cookies.js';
 import { hashSessionToken } from '../src/auth/session.service.js';
-import { CurrentUser } from '../src/common/decorators/current-user.js';
 import { Roles } from '../src/common/decorators/roles.decorator.js';
 import { RolesGuard } from '../src/common/guards/roles.guard.js';
 import { SessionGuard } from '../src/common/guards/session.guard.js';
-import type { SessionUser } from '../src/common/types/session-user.js';
 import { PrismaService } from '../src/prisma/prisma.service.js';
 
-// Throwaway routes: the real ones land with the auth controller.
+/**
+ * The last of the throwaway routes.
+ *
+ * SessionGuard and CsrfOriginGuard are driven through the real /auth routes
+ * below now. RolesGuard has no real @Roles route to sit on yet, and the thing
+ * only an HTTP test can show is the pairing: that a missing session answers 401
+ * before RolesGuard ever gets the chance to answer 403. This goes when the
+ * first admin route lands.
+ */
 @Controller('probe')
 class ProbeController {
-  @Get('me')
-  @UseGuards(SessionGuard)
-  me(@CurrentUser() user: SessionUser): SessionUser {
-    return user;
-  }
-
-  @Get('email')
-  @UseGuards(SessionGuard)
-  email(@CurrentUser('email') email: string): { email: string } {
-    return { email };
-  }
-
-  @Post('write')
-  @UseGuards(SessionGuard)
-  write(): { ok: boolean } {
-    return { ok: true };
-  }
-
   @Get('admin')
   @UseGuards(SessionGuard, RolesGuard)
   @Roles('ADMIN')
@@ -65,6 +53,9 @@ describe('guards (e2e)', () => {
 
   afterAll(async () => {
     if (userIds.length > 0) {
+      // Events first: AuthEvent.userId is SetNull on delete, so removing the
+      // users would orphan the rows the logout tests here write.
+      await prisma.authEvent.deleteMany({ where: { userId: { in: userIds } } });
       await prisma.user.deleteMany({ where: { id: { in: userIds } } });
     }
     await app.close();
@@ -105,12 +96,12 @@ describe('guards (e2e)', () => {
 
   describe('SessionGuard', () => {
     it('401s with no cookie', async () => {
-      await request(app.getHttpServer()).get('/probe/me').expect(401);
+      await request(app.getHttpServer()).get('/auth/me').expect(401);
     });
 
     it('401s on a garbage token', async () => {
       await request(app.getHttpServer())
-        .get('/probe/me')
+        .get('/auth/me')
         .set('Cookie', cookie('not-a-real-token'))
         .expect(401);
     });
@@ -120,7 +111,7 @@ describe('guards (e2e)', () => {
       const { token } = await makeSession(user.id);
 
       const res = await request(app.getHttpServer())
-        .get('/probe/me')
+        .get('/auth/me')
         .set('Cookie', cookie(token))
         .expect(200);
 
@@ -135,22 +126,11 @@ describe('guards (e2e)', () => {
       expect(res.headers['set-cookie']).toBeUndefined();
     });
 
-    it('feeds @CurrentUser with a single field', async () => {
-      const user = await makeUser();
-      const { token } = await makeSession(user.id);
-
-      const res = await request(app.getHttpServer())
-        .get('/probe/email')
-        .set('Cookie', cookie(token))
-        .expect(200);
-      expect(res.body).toEqual({ email: user.email });
-    });
-
     it('updates lastUsedAt', async () => {
       const user = await makeUser();
       const { token, session } = await makeSession(user.id);
 
-      await request(app.getHttpServer()).get('/probe/me').set('Cookie', cookie(token)).expect(200);
+      await request(app.getHttpServer()).get('/auth/me').set('Cookie', cookie(token)).expect(200);
 
       const after = await prisma.session.findUniqueOrThrow({ where: { id: session.id } });
       expect(after.lastUsedAt.getTime()).toBeGreaterThan(session.lastUsedAt.getTime());
@@ -165,7 +145,7 @@ describe('guards (e2e)', () => {
       const { token } = await makeSession(user.id, overrides);
 
       const res = await request(app.getHttpServer())
-        .get('/probe/me')
+        .get('/auth/me')
         .set('Cookie', cookie(token))
         .expect(401);
 
@@ -175,7 +155,7 @@ describe('guards (e2e)', () => {
     it('401s once the user is disabled', async () => {
       const user = await makeUser('USER', true);
       const { token } = await makeSession(user.id);
-      await request(app.getHttpServer()).get('/probe/me').set('Cookie', cookie(token)).expect(401);
+      await request(app.getHttpServer()).get('/auth/me').set('Cookie', cookie(token)).expect(401);
     });
 
     it('slides the window and re-sets the cookie', async () => {
@@ -185,7 +165,7 @@ describe('guards (e2e)', () => {
       });
 
       const res = await request(app.getHttpServer())
-        .get('/probe/me')
+        .get('/auth/me')
         .set('Cookie', cookie(token))
         .expect(200);
 
@@ -208,11 +188,7 @@ describe('guards (e2e)', () => {
         absoluteExpiresAt: cap,
       });
 
-      await request(app.getHttpServer())
-        .post('/probe/write')
-        .set('Cookie', cookie(token))
-        .set('Origin', 'http://localhost:3000')
-        .expect(201);
+      await request(app.getHttpServer()).get('/auth/me').set('Cookie', cookie(token)).expect(200);
 
       const after = await prisma.session.findUniqueOrThrow({ where: { id: session.id } });
       expect(after.expiresAt.getTime()).toBe(cap.getTime());
@@ -225,10 +201,10 @@ describe('guards (e2e)', () => {
       const { token } = await makeSession(user.id);
 
       await request(app.getHttpServer())
-        .post('/probe/write')
+        .post('/auth/logout')
         .set('Cookie', cookie(token))
         .set('Origin', 'http://localhost:3000')
-        .expect(201);
+        .expect(303);
     });
 
     it('403s a POST from a foreign origin', async () => {
@@ -236,7 +212,7 @@ describe('guards (e2e)', () => {
       const { token } = await makeSession(user.id);
 
       await request(app.getHttpServer())
-        .post('/probe/write')
+        .post('/auth/logout')
         .set('Cookie', cookie(token))
         .set('Origin', 'https://evil.com')
         .expect(403);
@@ -247,7 +223,7 @@ describe('guards (e2e)', () => {
       const { token } = await makeSession(user.id);
 
       await request(app.getHttpServer())
-        .post('/probe/write')
+        .post('/auth/logout')
         .set('Cookie', cookie(token))
         .expect(403);
     });
@@ -257,10 +233,20 @@ describe('guards (e2e)', () => {
       const { token } = await makeSession(user.id);
 
       await request(app.getHttpServer())
-        .post('/probe/write')
+        .post('/auth/logout')
         .set('Cookie', cookie(token))
         .set('Sec-Fetch-Site', 'same-origin')
-        .expect(201);
+        .expect(303);
+    });
+
+    it('answers before the session is even looked at', async () => {
+      // No cookie at all, and still 403 rather than 401: the global guard runs
+      // ahead of the controller's. A CSRF check that ran after authentication
+      // would be one an unauthenticated attacker has already walked past.
+      await request(app.getHttpServer())
+        .post('/auth/logout')
+        .set('Origin', 'https://evil.com')
+        .expect(403);
     });
 
     it('leaves GETs alone', async () => {
@@ -268,7 +254,7 @@ describe('guards (e2e)', () => {
       const { token } = await makeSession(user.id);
 
       await request(app.getHttpServer())
-        .get('/probe/me')
+        .get('/auth/me')
         .set('Cookie', cookie(token))
         .set('Origin', 'https://evil.com')
         .expect(200);

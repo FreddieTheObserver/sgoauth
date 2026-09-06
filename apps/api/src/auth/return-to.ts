@@ -9,6 +9,11 @@
 
 export const DEFAULT_RETURN_TO = '/dashboard';
 
+// The other end of the same idea: where the browser goes when there is no
+// session to send it anywhere else. Kept beside DEFAULT_RETURN_TO so the two
+// app paths this server hard-codes are declared in one place.
+export const LOGIN_PATH = '/login';
+
 // Long enough for any real in-app path, short enough that nothing interesting
 // fits in the Location header we echo it into.
 const MAX_LENGTH = 512;

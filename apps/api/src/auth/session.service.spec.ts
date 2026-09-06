@@ -130,3 +130,118 @@ describe('SessionService.validate', () => {
     );
   });
 });
+
+describe('SessionService revocation and the device list', () => {
+  const at = (offsetMs: number) => new Date(Date.now() + offsetMs);
+
+  type Where = Record<string, any>;
+  type FindManyArgs = { where: Where; select: Record<string, boolean>; orderBy: Where };
+  type UpdateManyArgs = { where: Where; data: Record<string, unknown> };
+
+  const listRow = (id: string) => ({
+    id,
+    userAgent: 'Mozilla/5.0',
+    createdAt: at(-86_400_000),
+    lastUsedAt: new Date(),
+    expiresAt: at(86_400_000),
+  });
+
+  const build = (rows: ReturnType<typeof listRow>[] = [], count = 1) => {
+    const findMany = vi.fn(async (_args: FindManyArgs) => rows);
+    const updateMany = vi.fn(async (_args: UpdateManyArgs) => ({ count }));
+    const service = new SessionService({
+      session: { findMany, updateMany },
+    } as unknown as PrismaService);
+    return { service, findMany, updateMany };
+  };
+
+  describe('listActive', () => {
+    it('asks only for sessions that could still authenticate', async () => {
+      const { service, findMany } = build();
+      await service.listActive('u1', 's-current');
+
+      const [args] = findMany.mock.calls[0];
+      expect(args.where).toMatchObject({
+        userId: 'u1',
+        revokedAt: null,
+        expiresAt: { gt: expect.any(Date) },
+        absoluteExpiresAt: { gt: expect.any(Date) },
+      });
+      // Most recently used first: the row the reader is looking for is the one
+      // they are least likely to recognise.
+      expect(args.orderBy).toEqual({ lastUsedAt: 'desc' });
+    });
+
+    it('never reads the token hash or the IP hash', async () => {
+      const { service, findMany } = build();
+      await service.listActive('u1', 's-current');
+
+      // Asserted as an exact set rather than a pair of absences, so widening
+      // what the device list returns has to be a deliberate edit here too.
+      const [args] = findMany.mock.calls[0];
+      expect(Object.keys(args.select).sort()).toEqual([
+        'createdAt',
+        'expiresAt',
+        'id',
+        'lastUsedAt',
+        'userAgent',
+      ]);
+    });
+
+    it('flags the row the caller is holding as the current device', async () => {
+      const { service } = build([listRow('s-current'), listRow('s-phone')]);
+      const list = await service.listActive('u1', 's-current');
+
+      expect(list.map((session) => [session.id, session.current])).toEqual([
+        ['s-current', true],
+        ['s-phone', false],
+      ]);
+    });
+  });
+
+  describe('revoke', () => {
+    it('scopes the update to the owner and to a session not already revoked', async () => {
+      const { service, updateMany } = build();
+      await expect(service.revoke('s1', 'u1')).resolves.toBe(true);
+
+      const [args] = updateMany.mock.calls[0];
+      // userId in the WHERE is the whole ownership check: another user's id
+      // matches nothing, so there is no row to act on and no read to leak one.
+      expect(args.where).toEqual({ id: 's1', userId: 'u1', revokedAt: null });
+      expect(args.data).toEqual({ revokedAt: expect.any(Date) });
+    });
+
+    it('reports nothing revoked when the id is not the caller’s', async () => {
+      const { service } = build([], 0);
+      await expect(service.revoke('someone-elses-session', 'u1')).resolves.toBe(false);
+    });
+  });
+
+  describe('revokeAll', () => {
+    it('closes every live session and says how many', async () => {
+      const { service, updateMany } = build([], 3);
+      await expect(service.revokeAll('u1')).resolves.toBe(3);
+
+      const [args] = updateMany.mock.calls[0];
+      expect(args.where).toMatchObject({
+        userId: 'u1',
+        revokedAt: null,
+        // Already-expired rows are left alone: they cannot authenticate, and
+        // stamping them would record a revocation that never happened.
+        expiresAt: { gt: expect.any(Date) },
+        absoluteExpiresAt: { gt: expect.any(Date) },
+      });
+    });
+
+    it('selects and stamps with one reading of the clock', async () => {
+      // Two readings would leave a window in which a session expires between
+      // being selected and being written, and the count would then overstate
+      // what was closed.
+      const { service, updateMany } = build([], 1);
+      await service.revokeAll('u1');
+
+      const [args] = updateMany.mock.calls[0];
+      expect(args.data.revokedAt).toEqual(args.where.expiresAt.gt);
+    });
+  });
+});

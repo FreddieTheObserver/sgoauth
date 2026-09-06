@@ -1,7 +1,7 @@
 import { Controller, ForbiddenException, Get, Logger, Query, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { AuditService, AuthEventType } from '../audit/audit.service.js';
-import { hashIp } from '../common/ip-hash.js';
+import { type RequestContext, requestContext } from '../common/request-context.js';
 import { AccountService } from './account.service.js';
 import {
   OAUTH_TX_COOKIE,
@@ -13,10 +13,8 @@ import { GoogleService, randomToken } from './google.service.js';
 import { LoginDeniedError } from './login-denied.error.js';
 import { OAuthTxService } from './oauth-tx.service.js';
 import { SessionService } from './session.service.js';
-import { safeReturnTo } from './return-to.js';
+import { LOGIN_PATH, safeReturnTo } from './return-to.js';
 import { timingSafeEqualString } from './timing.js';
-
-const LOGIN_PATH = '/login';
 
 /** Express gives back an array for a repeated query parameter; only a single
  * string is ever a legitimate value here. */
@@ -75,10 +73,7 @@ export class AuthController {
     @Req() request: Request,
     @Res() res: Response,
   ): Promise<void> {
-    const context = {
-      ipHash: hashIp(request.ip),
-      userAgent: request.get('user-agent') ?? null,
-    };
+    const context = requestContext(request);
 
     // 1. The user pressed Cancel on Google's consent screen. Not an attack, and
     // not something to answer with a 403 they cannot act on.
@@ -148,10 +143,7 @@ export class AuthController {
    * "state was wrong" and "that account is disabled" are different answers only
    * an attacker benefits from telling apart.
    */
-  private async deny(
-    reason: string,
-    context: { ipHash: string | null; userAgent: string | null },
-  ): Promise<never> {
+  private async deny(reason: string, context: RequestContext): Promise<never> {
     this.logger.warn(`Login denied: ${reason}`);
     await this.audit.record({
       type: AuthEventType.LoginDenied,

@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import type { SessionUser } from '../common/types/session-user.js';
 import { env } from '../config/env.js';
+import type { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
 const DAY_MS = 86_400_000;
@@ -22,6 +23,23 @@ export function hashSessionToken(token: string): Uint8Array<ArrayBuffer> {
 // safe, and what makes guessing a live session id not worth attempting.
 const TOKEN_BYTES = 32;
 
+/**
+ * The one definition of "could still authenticate": not revoked, inside the
+ * sliding window, and inside the hard cap.
+ *
+ * The device list and "log out everywhere" are built from the same predicate on
+ * purpose — a list that could show a row the mass revoke would skip is a list
+ * that lies about what pressing the button did.
+ */
+function activeSessions(userId: string, now: Date): Prisma.SessionWhereInput {
+  return {
+    userId,
+    revokedAt: null,
+    expiresAt: { gt: now },
+    absoluteExpiresAt: { gt: now },
+  };
+}
+
 export interface MintedSession {
   /** The raw cookie value. Held only long enough to be written to a header. */
   token: string;
@@ -33,6 +51,18 @@ export interface ValidatedSession {
   session: { id: string; expiresAt: Date };
   /** The sliding window moved — the caller must re-set the cookie with this expiry. */
   renewed: boolean;
+}
+
+/** One row of the device list. Everything the owner needs to recognise a
+ * session and decide to kill it, and nothing that would help anyone use it. */
+export interface DeviceSession {
+  id: string;
+  /** The session making this very request — the UI's "this device". */
+  current: boolean;
+  userAgent: string | null;
+  createdAt: Date;
+  lastUsedAt: Date;
+  expiresAt: Date;
 }
 
 @Injectable()
@@ -138,6 +168,79 @@ export class SessionService {
       session: { id: session.id, expiresAt },
       renewed,
     };
+  }
+
+  /**
+   * The device list: every session the user could still be signed in with, most
+   * recently used first.
+   */
+  async listActive(userId: string, currentSessionId: string): Promise<DeviceSession[]> {
+    const rows = await this.prisma.session.findMany({
+      where: activeSessions(userId, new Date()),
+      // An explicit allow-list, so a column added to Session later cannot reach
+      // an API response just by existing. tokenHash must never leave the
+      // database; ipHash stays behind too, since a salted digest tells the
+      // person reading their own device list nothing, while handing anyone who
+      // scraped the page a stable value for correlating sessions.
+      select: {
+        id: true,
+        userAgent: true,
+        createdAt: true,
+        lastUsedAt: true,
+        expiresAt: true,
+      },
+      orderBy: { lastUsedAt: 'desc' },
+    });
+
+    // Spread is safe here precisely because the select above is the allow-list:
+    // the shape is fixed by this query, not by the model.
+    return rows.map((row) => ({ ...row, current: row.id === currentSessionId }));
+  }
+
+  /**
+   * Revoke one session, and only if the caller owns it.
+   *
+   * Ownership is a WHERE clause rather than a read-then-compare: another user's
+   * id matches no row, so there is nothing to accidentally act on and no read
+   * whose outcome could confirm their session exists.
+   *
+   * `revokedAt: null` in the same clause keeps the first revocation
+   * authoritative — re-revoking would move the timestamp, and "when did this
+   * session actually die" is the question the row is retained to answer.
+   *
+   * False means nothing was revoked: not yours, not there, or already revoked.
+   * The caller answers all three identically.
+   */
+  async revoke(sessionId: string, userId: string): Promise<boolean> {
+    const { count } = await this.prisma.session.updateMany({
+      where: { id: sessionId, userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    return count > 0;
+  }
+
+  /**
+   * Log out everywhere, in one statement.
+   *
+   * This is the button someone presses when they believe they are compromised,
+   * so it must not be a delete: an update cannot race the row-level cascade,
+   * cannot half-succeed across N devices, and leaves the session.revoked event
+   * pointing at rows that still exist. What is left behind is a SHA-256 of a
+   * token no browser still holds.
+   *
+   * Already-expired rows are left alone — they cannot authenticate, and stamping
+   * them would record a revocation that never happened. The count is therefore
+   * what it claims to be: live sessions closed.
+   */
+  async revokeAll(userId: string): Promise<number> {
+    const now = new Date();
+    const { count } = await this.prisma.session.updateMany({
+      where: activeSessions(userId, now),
+      data: { revokedAt: now },
+    });
+
+    return count;
   }
 
   /**

@@ -4,10 +4,11 @@ import { AccountService } from './account.service.js';
 import { AuthController } from './auth.controller.js';
 import { GoogleService, googleJwksProvider } from './google.service.js';
 import { OAuthTxService } from './oauth-tx.service.js';
+import { SessionController } from './session.controller.js';
 
 @Module({
   imports: [AuditModule],
-  controllers: [AuthController],
+  controllers: [AuthController, SessionController],
   providers: [GoogleService, googleJwksProvider, OAuthTxService, AccountService],
 })
 export class AuthModule {}
