@@ -2,6 +2,7 @@ import "server-only";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { cache } from "react";
+import { type ApiDeviceSession, type DeviceView, toDeviceView } from "./dto";
 
 /**
  * The data access layer — the only place this app asks who is signed in.
@@ -47,19 +48,17 @@ function isSessionUser(value: unknown): value is SessionUser {
 }
 
 /**
- * Who is signed in, or null.
+ * One authenticated GET to the API, made on the browser's behalf.
  *
- * Wrapped in React's cache() so a render pass that checks the session in three
- * different components still makes one request. The cache is per request, so
- * nothing leaks between users.
+ * Returns null when the browser sent no cookies at all, which cannot be a
+ * session — skipping the round trip keeps a logged-out page render from touching
+ * the API even once.
  */
-export const getSession = cache(async (): Promise<SessionUser | null> => {
+async function apiGet(path: string): Promise<Response | null> {
   const cookieHeader = (await cookies()).toString();
-  // No cookies at all cannot be a session. Skipping the round trip keeps a
-  // logged-out page render from touching the API at all.
   if (!cookieHeader) return null;
 
-  const response = await fetch(`${API_ORIGIN}/auth/me`, {
+  return fetch(`${API_ORIGIN}${path}`, {
     // Forwarded verbatim: this request is made on the browser's behalf, and in a
     // single-origin app every cookie the browser holds is already the API's.
     headers: { cookie: cookieHeader },
@@ -67,11 +66,22 @@ export const getSession = cache(async (): Promise<SessionUser | null> => {
     // cached answer here would be one visitor's identity served to the next.
     cache: "no-store",
   });
+}
+
+/**
+ * Who is signed in, or null.
+ *
+ * Wrapped in React's cache() so a render pass that checks the session in three
+ * different components still makes one request. The cache is per request, so
+ * nothing leaks between users.
+ */
+export const getSession = cache(async (): Promise<SessionUser | null> => {
+  const response = await apiGet("/auth/me");
 
   // 401 is an answer: not signed in. Anything else is the API being broken or
   // unreachable, which is a different thing and must not be quietly rendered as
   // "logged out" — that turns an outage into an endless redirect to /login.
-  if (response.status === 401) return null;
+  if (!response || response.status === 401) return null;
   if (!response.ok) {
     throw new Error(`/auth/me answered ${response.status}`);
   }
@@ -94,4 +104,32 @@ export async function verifySession(): Promise<SessionUser> {
   const user = await getSession();
   if (!user) redirect(LOGIN_PATH);
   return user;
+}
+
+/**
+ * The device list, already narrowed for the page that renders it.
+ *
+ * Only ever reached from behind verifySession(), so a 401 here means the session
+ * died between that check and this call — a revoke from another browser landing
+ * in the gap. Sending the caller to /login is the answer verifySession itself
+ * would have given a moment earlier.
+ */
+export async function getDevices(): Promise<DeviceView[]> {
+  const response = await apiGet("/auth/sessions");
+  if (!response || response.status === 401) redirect(LOGIN_PATH);
+  if (!response.ok) {
+    throw new Error(`/auth/sessions answered ${response.status}`);
+  }
+
+  const body: unknown = await response.json();
+  if (!Array.isArray(body) || !body.every(isDeviceSession)) {
+    throw new Error("/auth/sessions answered with an unexpected shape");
+  }
+
+  return body.map(toDeviceView);
+}
+
+function isDeviceSession(value: unknown): value is ApiDeviceSession {
+  const row = value as Partial<ApiDeviceSession> | null;
+  return typeof row?.id === "string" && typeof row.current === "boolean";
 }

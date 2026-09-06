@@ -1,4 +1,5 @@
 import Image from "next/image";
+import Link from "next/link";
 import { verifySession } from "@/lib/dal";
 
 export default async function DashboardPage() {
@@ -36,6 +37,16 @@ export default async function DashboardPage() {
             <dd className="font-medium">{user.role}</dd>
           </div>
         </dl>
+
+        <Link
+          href="/settings/sessions"
+          className="block rounded-lg border border-black/10 p-4 text-sm transition-colors hover:bg-black/5 dark:border-white/15 dark:hover:bg-white/10"
+        >
+          Where you are signed in
+          <span className="mt-1 block text-black/60 dark:text-white/60">
+            Review your devices and sign any of them out.
+          </span>
+        </Link>
 
         {/*
           A plain form POST, not a fetch(). The browser stamps it with an Origin
