@@ -244,6 +244,39 @@ export class SessionService {
   }
 
   /**
+   * Delete session rows that have been dead long enough to stop being evidence.
+   *
+   * Revoked rows are kept rather than deleted on revocation, and this is where
+   * that debt is paid: the device list has to tell "you revoked this" from "this
+   * row never existed", and a session.revoked event is only correlatable while
+   * the session it names still exists. Both of those matter for a bounded time,
+   * not forever.
+   *
+   * The retention window is SESSION_ABSOLUTE_TTL_DAYS, reused rather than
+   * configured separately — it is already this deployment's own statement of how
+   * long a session can matter, so a row is kept for one more full lifetime after
+   * it stopped being one.
+   *
+   * No clause for absoluteExpiresAt: it is never earlier than expiresAt, so a
+   * row past the cap is already past the sliding expiry the query does check.
+   */
+  async pruneDead(now = new Date()): Promise<number> {
+    const cutoff = new Date(now.getTime() - this.absoluteTtlMs);
+
+    const { count } = await this.prisma.session.deleteMany({
+      where: {
+        OR: [
+          // Indexed — see @@index([expiresAt]) on the model.
+          { expiresAt: { lt: cutoff } },
+          { revokedAt: { lt: cutoff } },
+        ],
+      },
+    });
+
+    return count;
+  }
+
+  /**
    * Extend only in the back half of the window: renewing on every request costs
    * a write and a `Set-Cookie` header to buy a few seconds of lifetime. Idle
    * sessions still die, active ones never expire under the user, and the

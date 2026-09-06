@@ -1,4 +1,5 @@
 import { Controller, ForbiddenException, Get, Logger, Query, Req, Res } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { AuditService, AuthEventType } from '../audit/audit.service.js';
 import { type RequestContext, requestContext } from '../common/request-context.js';
@@ -23,6 +24,13 @@ function single(value: unknown): string | null {
 }
 
 @Controller('auth')
+// Much tighter than the global floor, because these two routes are where login
+// attempts arrive: brute force, callback flooding, and a stream of handshakes
+// started only to make us mint state. Twenty a minute rather than the five that
+// one real user needs, because an office or a campus reaches this from a single
+// egress address and a limit that locks them out is a denial of service we
+// inflicted on ourselves.
+@Throttle({ default: { limit: 20, ttl: 60_000 } })
 export class AuthController {
   private readonly logger = new Logger(AuthController.name);
 

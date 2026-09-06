@@ -2,15 +2,21 @@ import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
+import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module.js';
 import { env, isProduction } from './config/env.js';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  // Buffered so the lines Nest writes while wiring modules are held until the
+  // real logger exists, and then replayed through it. Without this the boot logs
+  // are the one part of the output that is neither structured nor redacted.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
+  app.useLogger(app.get(Logger));
 
   // The API only ever sees traffic through Next's /api/* rewrite, so the real
-  // client address arrives in X-Forwarded-For. Without this every session row
-  // and rate-limit bucket would key on the proxy instead of the user.
+  // client address arrives in X-Forwarded-For. Without this every session row,
+  // log line and rate-limit bucket would key on the proxy instead of the user —
+  // which for the throttler means one shared bucket for every visitor at once.
   app.set('trust proxy', 1);
 
   app.use(

@@ -245,3 +245,43 @@ describe('SessionService revocation and the device list', () => {
     });
   });
 });
+
+describe('SessionService.pruneDead', () => {
+  const DAY = 86_400_000;
+
+  const build = (count = 0) => {
+    const deleteMany = vi.fn(async (_args: { where: Record<string, any> }) => ({ count }));
+    const service = new SessionService({ session: { deleteMany } } as unknown as PrismaService);
+    return { service, deleteMany };
+  };
+
+  it('keeps a dead row for one more absolute lifetime before deleting it', () => {
+    // Revoked rows are retained so the device list can tell "you revoked this"
+    // from "this never existed", and so a session.revoked event still points at
+    // something. Both stop mattering; SESSION_ABSOLUTE_TTL_DAYS is how long the
+    // deployment already said a session can matter, reused as that window.
+    const { service, deleteMany } = build();
+    const now = new Date();
+    void service.pruneDead(now);
+
+    const [args] = deleteMany.mock.calls[0];
+    const cutoff = new Date(now.getTime() - 30 * DAY);
+    expect(args.where.OR).toEqual([{ expiresAt: { lt: cutoff } }, { revokedAt: { lt: cutoff } }]);
+  });
+
+  it('spares a session that only died today', async () => {
+    // Asserted through the cutoff rather than a fixture, since the query is the
+    // whole behaviour: yesterday is nowhere near 30 days ago.
+    const { service, deleteMany } = build();
+    await service.pruneDead(new Date());
+
+    const [args] = deleteMany.mock.calls[0];
+    const cutoff: Date = args.where.OR[0].expiresAt.lt;
+    expect(cutoff.getTime()).toBeLessThan(Date.now() - 29 * DAY);
+  });
+
+  it('reports how many rows went', async () => {
+    const { service } = build(7);
+    await expect(service.pruneDead()).resolves.toBe(7);
+  });
+});

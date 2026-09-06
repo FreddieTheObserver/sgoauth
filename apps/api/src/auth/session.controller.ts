@@ -34,6 +34,11 @@ import { SessionService, type DeviceSession } from './session.service.js';
  */
 @Controller('auth')
 @UseGuards(SessionGuard)
+// Deliberately left on the global rate limit rather than the handshake's tight
+// one. /auth/me is what the web app's DAL calls on every render, so a bucket
+// sized for login attempts would log out anyone navigating quickly. There is
+// nothing to brute-force here anyway: every route is already behind a session
+// and scoped to rows the caller owns.
 export class SessionController {
   constructor(
     private readonly sessions: SessionService,
